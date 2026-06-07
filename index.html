@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<title>Ultimate 3D Δ-Indexing Physics (10,000 Bodies)</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #050505; font-family: sans-serif; }
+  canvas { display: block; }
+  #info { position: absolute; top: 15px; left: 15px; color: #fff; pointer-events: none; text-shadow: 0 2px 4px rgba(0,0,0,0.8); }
+  h1 { margin: 0 0 5px 0; font-size: 18px; color: #0ff; }
+  p { margin: 0; font-size: 12px; color: #aaa; }
+</style>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.161.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.161.0/examples/jsm/",
+    "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19/+esm"
+  }
+}
+</script>
+</head>
+<body>
+
+<div id="info">
+  <h1>3D Δ-Indexing Physics</h1>
+  <p>10,000 Bodies | O(N) Broad-phase | 27-Cell Narrow-phase</p>
+  <p id="fps">FPS: --</p>
+  <p id="mem">Memory: --</p>
+</div>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import GUI from "lil-gui";
+
+// ===================== GUI =====================
+const params = {
+  attraction: 0.0005,
+  damping:   0.96,
+  pushForce: 0.6,
+  repulsion: 0.12,
+  radius:    0.45
+};
+
+const gui = new GUI({ title: "Physics Settings" });
+gui.add(params, "attraction", 0, 0.002);
+gui.add(params, "damping", 0.90, 1.0);
+gui.add(params, "pushForce", 0, 1.0);
+gui.add(params, "repulsion", 0, 0.5);
+gui.add(params, "radius", 0.1, 1.0);
+
+// ===================== Simulation =====================
+const N = 7500;
+const worldSize = 100;
+const half = worldSize / 2;
+const L = 4.0;
+
+const gridCols   = Math.ceil(worldSize / L);
+const gridRows   = Math.ceil(worldSize / L);
+const gridLayers = Math.ceil(worldSize / L);
+const M = gridCols * gridRows * gridLayers;
+
+const pos    = new Float32Array(N * 3);
+const vel    = new Float32Array(N * 3);
+const radius = new Float32Array(N);
+
+const gx = new Int16Array(N);
+const gy = new Int16Array(N);
+const gz = new Int16Array(N);
+
+const gridHead = new Int32Array(M);
+const next     = new Int32Array(N);
+
+// 初期化
+for (let i = 0; i < N; i++) {
+  const i3 = i * 3;
+  pos[i3]   = (Math.random() - 0.5) * worldSize;
+  pos[i3+1] = (Math.random() - 0.5) * worldSize;
+  pos[i3+2] = (Math.random() - 0.5) * worldSize;
+
+  vel[i3]   = (Math.random() - 0.5) * 0.5;
+  vel[i3+1] = (Math.random() - 0.5) * 0.5;
+  vel[i3+2] = (Math.random() - 0.5) * 0.5;
+
+  radius[i] = params.radius;
+}
+
+// ===================== Δ-Indexing =====================
+function cellIndex(ix, iy, iz) {
+  return iz * (gridCols * gridRows) + iy * gridCols + ix;
+}
+
+function updateGrid() {
+  gridHead.fill(-1);
+  for (let i = 0; i < N; i++) {
+    const i3 = i * 3;
+    let cx = Math.floor((pos[i3]   + half) / L);
+    let cy = Math.floor((pos[i3+1] + half) / L);
+    let cz = Math.floor((pos[i3+2] + half) / L);
+
+    if (cx < 0) cx = 0; else if (cx >= gridCols)   cx = gridCols - 1;
+    if (cy < 0) cy = 0; else if (cy >= gridRows)   cy = gridRows - 1;
+    if (cz < 0) cz = 0; else if (cz >= gridLayers) cz = gridLayers - 1;
+
+    gx[i] = cx; gy[i] = cy; gz[i] = cz;
+
+    const k = cellIndex(cx, cy, cz);
+    next[i] = gridHead[k];
+    gridHead[k] = i;
+  }
+}
+
+// ===================== 衝突 narrow-phase =====================
+function narrowPhase(i, j) {
+  const i3 = i * 3, j3 = j * 3;
+  const dx = pos[j3]   - pos[i3];
+  const dy = pos[j3+1] - pos[i3+1];
+  const dz = pos[j3+2] - pos[i3+2];
+
+  const ri = radius[i];
+  const rj = radius[j];
+  const minDist = ri + rj;
+
+  const d2 = dx*dx + dy*dy + dz*dz;
+  if (d2 === 0 || d2 >= minDist * minDist) return;
+
+  const dist = Math.sqrt(d2);
+  const overlap = minDist - dist;
+  const nx = dx / dist;
+  const ny = dy / dist;
+  const nz = dz / dist;
+
+  const push = overlap * params.pushForce * 0.5;
+  pos[i3]   -= nx * push;
+  pos[i3+1] -= ny * push;
+  pos[i3+2] -= nz * push;
+  pos[j3]   += nx * push;
+  pos[j3+1] += ny * push;
+  pos[j3+2] += nz * push;
+
+  const rep = overlap * params.repulsion;
+  vel[i3]   -= nx * rep;
+  vel[i3+1] -= ny * rep;
+  vel[i3+2] -= nz * rep;
+  vel[j3]   += nx * rep;
+  vel[j3+1] += ny * rep;
+  vel[j3+2] += nz * rep;
+}
+
+function solveCollisions() {
+  for (let i = 0; i < N; i++) {
+    const cx = gx[i], cy = gy[i], cz = gz[i];
+
+    for (let oz = -1; oz <= 1; oz++) {
+      for (let oy = -1; oy <= 1; oy++) {
+        for (let ox = -1; ox <= 1; ox++) {
+          const nx = cx + ox;
+          const ny = cy + oy;
+          const nz = cz + oz;
+          if (nx < 0 || nx >= gridCols ||
+              ny < 0 || ny >= gridRows ||
+              nz < 0 || nz >= gridLayers) continue;
+
+          const cellIdx = cellIndex(nx, ny, nz);
+          let j = gridHead[cellIdx];
+          while (j !== -1) {
+            if (i < j) narrowPhase(i, j);
+            j = next[j];
+          }
+        }
+      }
+    }
+  }
+}
+
+// ===================== Three.js =====================
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x050505, 0.005);
+
+const camera = new THREE.PerspectiveCamera(
+  60,
+  window.innerWidth / window.innerHeight,
+  0.1,
+  1000
+);
+camera.position.set(worldSize * 1.2, worldSize * 0.8, worldSize * 1.2);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.autoRotate = true;
+controls.autoRotateSpeed = 0.5;
+
+scene.add(new THREE.AmbientLight(0x444444));
+const light = new THREE.DirectionalLight(0xffffff, 2.0);
+light.position.set(1, 2, 1);
+scene.add(light);
+
+const geometry = new THREE.IcosahedronGeometry(1, 0);
+const material = new THREE.MeshPhongMaterial({ color: 0xffffff });
+const mesh = new THREE.InstancedMesh(geometry, material, N);
+scene.add(mesh);
+
+const dummy = new THREE.Object3D();
+const _color = new THREE.Color();
+
+// ===================== FPS & Memory =====================
+let last = performance.now();
+let frames = 0;
+
+function updateStats() {
+  const now = performance.now();
+  frames++;
+
+  if (now - last >= 1000) {
+    document.getElementById("fps").textContent = `FPS: ${frames}`;
+    frames = 0;
+    last = now;
+
+    if (performance.memory) {
+      const used = (performance.memory.usedJSHeapSize / 1048576).toFixed(1);
+      const total = (performance.memory.totalJSHeapSize / 1048576).toFixed(1);
+      document.getElementById("mem").textContent =
+        `Memory: ${used} MB / ${total} MB`;
+    }
+  }
+}
+
+// ===================== Main Loop =====================
+function animate() {
+  requestAnimationFrame(animate);
+
+  // 力学
+  for (let i = 0; i < N; i++) {
+    const i3 = i * 3;
+
+    const x = pos[i3];
+    const y = pos[i3+1];
+    const z = pos[i3+2];
+
+    vel[i3]   += -x * params.attraction;
+    vel[i3+1] += -y * params.attraction;
+    vel[i3+2] += -z * params.attraction;
+
+    pos[i3]   += vel[i3];
+    pos[i3+1] += vel[i3+1];
+    pos[i3+2] += vel[i3+2];
+
+    vel[i3]   *= params.damping;
+    vel[i3+1] *= params.damping;
+    vel[i3+2] *= params.damping;
+
+    if (pos[i3] < -half || pos[i3] > half) {
+      vel[i3] *= -0.6;
+      pos[i3] = THREE.MathUtils.clamp(pos[i3], -half, half);
+    }
+    if (pos[i3+1] < -half || pos[i3+1] > half) {
+      vel[i3+1] *= -0.6;
+      pos[i3+1] = THREE.MathUtils.clamp(pos[i3+1], -half, half);
+    }
+    if (pos[i3+2] < -half || pos[i3+2] > half) {
+      vel[i3+2] *= -0.6;
+      pos[i3+2] = THREE.MathUtils.clamp(pos[i3+2], -half, half);
+    }
+
+    radius[i] = params.radius;
+  }
+
+  updateGrid();
+  solveCollisions();
+
+  for (let i = 0; i < N; i++) {
+    const i3 = i * 3;
+
+    dummy.position.set(pos[i3], pos[i3+1], pos[i3+2]);
+    dummy.scale.set(radius[i], radius[i], radius[i]);
+    dummy.updateMatrix();
+    mesh.setMatrixAt(i, dummy.matrix);
+  }
+
+  mesh.instanceMatrix.needsUpdate = true;
+
+  controls.update();
+  renderer.render(scene, camera);
+
+  updateStats();
+}
+
+animate();
+
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
